@@ -1,0 +1,46 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Deploys the myCinemaz movie scraper application, including a Lambda function
+  and an S3 bucket to store the scraped data and posters.
+
+Resources:
+  # The S3 bucket where posters and movie.json will be stored
+  DataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "movie-scraper-data-${AWS::AccountId}" # Creates a globally unique bucket name
+
+  # The Lambda function that runs the scraper
+  ScraperFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: myCinemaz-scraper
+      CodeUri: . # Tells SAM to look for the code in the current folder
+      Handler: lambda_function.lambda_handler # The entry point: lambda_function.py -> lambda_handler function
+      Runtime: python3.11
+      Timeout: 900 # 15 minutes, the maximum allowed
+      MemorySize: 256 # in MB
+      Environment:
+        Variables:
+          # Pass the name of the S3 bucket to the function as an environment variable
+          S3_BUCKET_NAME: !Ref DataBucket
+      Policies:
+        # Give the function permission to write objects to the S3 bucket
+        - S3WritePolicy:
+            BucketName: !Ref DataBucket
+      Events:
+        # Trigger this function automatically once every day
+        DailySchedule:
+          Type: Schedule
+          Properties:
+            Schedule: "rate(1 day)"
+            Name: DailyMovieScrapeTrigger
+            Description: "Triggers the movie scraper function daily."
+            Enabled: true
+
+Outputs:
+  # Provides the name of the created S3 bucket as an output after deployment
+  BucketName:
+    Description: "The name of the S3 bucket for storing movie data and posters."
+    Value: !Ref DataBucket
