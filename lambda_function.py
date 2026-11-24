@@ -90,19 +90,26 @@ async def download_and_upload_poster_to_s3(client: httpx.AsyncClient, image_url:
 def parse_showtimes_from_html(soup: BeautifulSoup) -> dict:
     """Parses the cinema and showtime data from a given HTML soup object."""
     showtimes = {}
-    cinema_divs = soup.select('#ShowtimesList > a, #ShowtimesList > div')
-    current_cinema = 'N/A'
-    for element in cinema_divs:
-        if element.name == 'a':
-            b_tag = element.find('b')
-            if b_tag:
-                current_cinema = b_tag.text.strip()
+    showtimes_lists = soup.select('#ShowtimesList')
+    if not showtimes_lists:
+        return showtimes
+
+    for showtimes_list in showtimes_lists:
+        current_cinema = 'N/A'
+        for element in (child for child in showtimes_list.children if getattr(child, 'name', None)):
+            cinema_heading = element.find('b') if element.name in ('h3', 'a') else None
+            if cinema_heading:
+                current_cinema = cinema_heading.get_text(' ', strip=True)
                 if current_cinema not in showtimes:
                     showtimes[current_cinema] = []
-        elif element.name == 'div':
-            times = [t.text.strip() for t in element.select('div.showbox a, div.showbox') if t.text.strip()]
-            if times and current_cinema != 'N/A':
-                showtimes[current_cinema].extend(times)
+            elif element.name == 'div':
+                times = [
+                    time.get_text(' ', strip=True)
+                    for time in element.select('.showbox')
+                    if time.get_text(' ', strip=True)
+                ]
+                if times and current_cinema != 'N/A':
+                    showtimes[current_cinema].extend(times)
     # Remove duplicates
     for cinema in showtimes:
         showtimes[cinema] = sorted(list(set(showtimes[cinema])))
@@ -120,9 +127,10 @@ async def scrape_aggregated_showtimes(client: httpx.AsyncClient, showtimes_url: 
         response.raise_for_status()
         soup = BeautifulSoup(response.text, 'lxml')
 
-        date_dropdown = soup.select_one('#ctl00_cphContent_ctl00_ddlShowdate')
+        date_dropdown = soup.select_one('select[id*="ddlShowdate"]')
         if not date_dropdown: return 'N/A'
         
+        target_name = date_dropdown.get('name', 'ctl00$cphContent$ctl01$ddlShowdate')
         date_options = [(opt.get('value'), opt.text) for opt in date_dropdown.find_all('option') if opt.get('value')]
         date_options = date_options[:MAX_DAYS_TO_SCRAPE] if MAX_DAYS_TO_SCRAPE else date_options
 
@@ -139,9 +147,9 @@ async def scrape_aggregated_showtimes(client: httpx.AsyncClient, showtimes_url: 
             await asyncio.sleep(REQUEST_DELAY)
 
             form_data = {
-                '__EVENTTARGET': 'ctl00$cphContent$ctl00$ddlShowdate', '__EVENTARGUMENT': '', '__LASTFOCUS': '',
+                '__EVENTTARGET': target_name, '__EVENTARGUMENT': '', '__LASTFOCUS': '',
                 '__VIEWSTATE': viewstate, '__EVENTVALIDATION': eventvalidation,
-                'ctl00$cphContent$ctl00$ddlShowdate': date_val,
+                target_name: date_val,
             }
             post_response = await client.post(showtimes_url, data=form_data, headers=HTTP_HEADERS)
             
@@ -251,6 +259,24 @@ def lambda_handler(event, context):
         all_movie_data = asyncio.run(scraper_main())
 
         if all_movie_data:
+            populated_showtime_records = 0
+            for movie in all_movie_data:
+                raw_showtimes = movie.get('Aggregated Showtimes Data')
+                try:
+                    parsed_showtimes = json.loads(raw_showtimes) if isinstance(raw_showtimes, str) else raw_showtimes
+                except (TypeError, json.JSONDecodeError):
+                    parsed_showtimes = []
+                if isinstance(parsed_showtimes, list) and parsed_showtimes:
+                    populated_showtime_records += 1
+
+            if populated_showtime_records == 0:
+                error_message = (
+                    f"Scraped {len(all_movie_data)} movies but found no showtimes. "
+                    "The existing S3 movie.json was preserved."
+                )
+                print(error_message)
+                return {'statusCode': 500, 'body': json.dumps(error_message)}
+
             json_s3_key = 'movie.json'
             
             # Save the final JSON data to S3, overwriting the previous file
